@@ -1,109 +1,47 @@
-# Gargantua
 
-A real-time black hole renderer in a single `index.html` — Three.js just
-opens a WebGL canvas; everything you see is one GLSL fragment shader
-raymarching curved light paths around a Schwarzschild black hole.
 
-**Run it:** open `index.html` in any WebGL-capable browser. No install, no
-build. **Controls:** drag to orbit, scroll to zoom.
+# 🕳️ Gargantua | Black Hole Simulator
 
-## The physics
+A real-time black hole renderer in WebGL. The bent light, glowing disk, and the warped background runs inside a single GLSL shader that traces curved light paths around a black hole. Vibecoded with Sonnet 5.
 
-### Event horizon
+# 🖥️ Code
 
-A non-spinning black hole of mass `M` has an event horizon at the
-**Schwarzschild radius**:
+Run it by clicking the link on the right or with this:
 
-```
-r_s = 2GM / c²
-```
+    python3 -m http.server 8000
 
-Nothing that crosses `r_s` — not even light — escapes. The simulation works
-in natural units where `r_s = 1` (the uniform `uRs`); every other distance in
-the scene (disk radii, camera range) is expressed as a multiple of it.
+The `index.html` file uses Three.js simply to set up a flat, blank canvas on your screen. JavaScript only handles your mouse controls and updates the camera angle. 
 
-### Bending light: the geodesic equation
+The GPU does all the heavy lifting inside a single GLSL fragment shader, there are no actual 3D models, polygons, or textures in this project, instead, the code uses a technique called raymarching: for every single pixel on your monitor, the graphics card shoots a virtual ray of light into the scene, it calculates the math step by step, bending the ray through the black hole's gravity field until it either crashes into the glowing disk, gets swallowed by the event horizon, or escapes to hit a background star. 
 
-Light doesn't travel in straight lines near a strong gravity well — it
-follows a **null geodesic** of the Schwarzschild metric. In the orbital
-plane, using `u = 1/r`, the exact photon trajectory satisfies:
+Because GPUs are designed to solve thousands of math problems at the exact same time, they can calculate these millions of curved light paths 60 times a second directly in your browser.
 
-```
-d²u/dφ² + u = (3/2) · r_s · u²
-```
+# 🌠 The Physics
 
-The right-hand side is the general-relativistic correction; without it
-(`d²u/dφ² + u = 0`) you get plain straight-line optics. Solving this exactly
-needs an RK4 integrator in `φ`. This shader instead uses the equivalent
-Cartesian **force approximation**, integrated directly in 3D:
+The math is scaled so the black hole's event horizon (the point of no return, `r_s`) has a radius of `1`. Everything else is measured relative to that.
 
-```
-a(pos) = -1.5 · r_s · |h|² / r⁵ · pos,   h = pos₀ × dir₀
-```
+### Bending Light
+Instead of using insane 4D spacetime math, the code fakes the light bending perfectly in 3D by applying a "pull" to each light ray as it travels:
 
-`h` is the photon's angular momentum, fixed at the ray's start. Because the
-force always points along `±pos` (a *central* force), `h` is exactly
-conserved — `d/dt(pos × v) = v×v + pos×a = 0` — so the photon provably stays
-in a single plane, matching real Schwarzschild geodesics, even though the
-force law is a leading-order stand-in for the exact equation above. Rays are
-marched with adaptive step size (fine near the hole, coarse far away) until
-they either cross `r_s` (absorbed) or escape to sample the starfield —
-which is exactly why the **Einstein ring** (a lensed, ring-shaped image of
-whatever's directly behind the hole) just falls out of the raymarch, with no
-special-case code for it.
+    a(pos) = -1.5 · r_s · |h|² / r⁵ · pos
+    h = pos₀ × dir₀
 
-Real gravity has infinite range, but for a compact, cinematic silhouette the
-shader windows the force with `atten = 1 / (1 + (r/uDiskOuter)^8)` — an
-artistic (non-physical) choice. It's steep enough that distortion stays
-tight around the disk, but stays C-infinity smooth (unlike a hard on/off
-cutoff, tried and discarded: it left a visible ring-shaped seam in the
-starfield, since bending stopped dead at one exact radius instead of fading
-out naturally).
+Because this pull always points straight at the black hole, the light path stays totally flat, just like in real physics. The code traces the ray until it either falls into the black hole (goes black) or escapes into space (hits a star). This naturally creates that famous "Einstein ring" halo without us having to draw a circle manually.
 
-### The accretion disk
+### Accretion Disk
+Matter can't orbit too close to a black hole without falling in, the closest safe distance is the ISCO:
 
-Matter spiraling into a black hole heats up and glows before crossing the
-horizon. The innermost radius a stable circular orbit can exist at is the
-**ISCO** (innermost stable circular orbit):
+    r_isco = 3 · r_s
 
-```
-r_isco = 3 · r_s     (Schwarzschild, non-spinning)
-```
+Our glowing disk of gas starts exactly there, which leaves a realistic dark gap between the fire and the black hole. The gas moves much faster on the inside so we color it white, on the outside it's dark red.
 
-Below that, orbits are unstable and matter plunges in — so the disk in this
-scene starts at `uDiskInner ≈ 3·r_s`. It's rendered as a thin ring in the
-horizontal plane; density comes from animated fractal (fBm) noise advected
-by roughly Keplerian differential rotation, `ω(r) ∝ r^(-3/2)`, and color
-follows a blackbody-ish ramp — white-hot near the ISCO, cooling to red at
-the outer edge.
+### Relativistic Beaming (Doppler Effect)
+Because the disk is spinning incredibly fast, the side coming towards you looks brighter and slightly bluer, while the side spinning away looks dimmer and redder. The shader calculates this Doppler effect using:
 
-### Relativistic beaming
+    D = 1 / (1 - v · cos(θ))
+    I_obs = D³ · I_emit
 
-Since the disk spins, one side always moves toward the camera and the other
-away — and special relativity says approaching sources look brighter and
-bluer, receding ones dimmer and redder. The **relativistic Doppler factor**
-for a source moving at velocity `v` is:
+### The Background Sky
+The code builds a space environment filled with starfields, colored nebulas, random comets, and a few giant marker stars. Because the virtual light rays are bent by gravity before they reach this background, the stars/nebulas get stretched, creating optical illusions when you orbit the camera around the black hole.
 
-```
-D = 1 / (1 - v·μ)         μ = cos(angle between velocity and line of sight)
-```
-
-Observed intensity scales as `I_obs = D³ · I_emit` (relativistic beaming).
-The shader computes `v(r) ≈ sqrt(r_s / 2r)` (Keplerian speed, capped below
-`c`) and uses `D` both to brighten/dim the disk and to push its color toward
-blue (approaching) or red (receding) — the classic asymmetric-brightness look
-of every serious black hole render since *Interstellar*.
-
-## What's real vs. artistic license
-
-| Real physics | Simplified / stylized |
-|---|---|
-| Schwarzschild horizon at `r_s`, ISCO at `3r_s` | Force-law lensing instead of exact geodesic RK4 |
-| Central-force ⇒ planar, angular-momentum-conserving light paths | Lensing artificially windowed off past the disk (real gravity has no cutoff) |
-| Relativistic Doppler beaming (`D³`, color shift) | No gravitational redshift/time-dilation dimming near the horizon |
-| Einstein ring emergent from raymarching, not drawn | Background comets/marker stars are cinematic flourishes, not physical |
-
-## More
-
-Full uniform list, exact tuning constants, and the resume-from-scratch next
-steps live in `SUMMARY.md`.
+---
