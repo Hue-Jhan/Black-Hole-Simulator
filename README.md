@@ -2,7 +2,13 @@
 
 # 🕳️ Gargantua | Black Hole Simulator
 
-A real-time black hole renderer in WebGL. The bent light, glowing disk, and the warped background runs inside a single GLSL shader that traces curved light paths around a black hole. Vibecoded with Sonnet 5.
+Black hole renderer in WebGL. The bent light, glowing disk, and the warped background runs inside a single GLSL shader that traces curved light paths around a black hole. Vibecoded with Sonnet 5.
+
+
+
+https://github.com/user-attachments/assets/3606fbc3-d592-4b94-bb92-308e30d2716a
+
+
 
 # 🖥️ Code
 
