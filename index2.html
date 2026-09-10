@@ -1,0 +1,622 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Gargantua — Cinematic Edge-On</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #000; height: 100%; }
+  canvas { display: block; touch-action: none; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  #hint {
+    position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
+    color: #90a0c0; font: 12px/1.4 -apple-system, system-ui, sans-serif;
+    opacity: 0.55; pointer-events: none; user-select: none; letter-spacing: .02em;
+    text-shadow: 0 1px 4px rgba(0,0,0,0.8);
+  }
+  #panel {
+    position: fixed; top: 50%; right: 14px; transform: translateY(-50%);
+    background: rgba(10, 8, 14, 0.55); backdrop-filter: blur(6px);
+    border: 1px solid rgba(255, 200, 150, 0.15); border-radius: 10px;
+    padding: 12px 14px; width: 150px;
+    font: 12px/1.4 -apple-system, system-ui, sans-serif; color: #d8ccc0;
+    user-select: none;
+  }
+  #panel label { display: block; opacity: 0.75; margin-bottom: 4px; }
+  #panel output { float: right; opacity: 0.55; }
+  #panel input[type=range] {
+    width: 100%; accent-color: #ff8f3a; cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<div id="hint">drag to orbit &middot; scroll to zoom</div>
+<div id="panel">
+  <label for="tilt">axis tilt <output id="tiltVal">0&deg;</output></label>
+  <input id="tilt" type="range" min="-75" max="75" step="1" value="0">
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from "three";
+
+// ---------------------------------------------------------------------------
+// Renderer / scene / fullscreen quad
+// ---------------------------------------------------------------------------
+const scene = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const uniforms = {
+  iResolution:    { value: new THREE.Vector2() },
+  iTime:          { value: 0 },
+  camPos:         { value: new THREE.Vector3() },
+  camRight:       { value: new THREE.Vector3() },
+  camUp:          { value: new THREE.Vector3() },
+  camForward:     { value: new THREE.Vector3() },
+  camFov:         { value: THREE.MathUtils.degToRad(50.0) },
+  uRs:            { value: 1.0 },   // Schwarzschild radius (event horizon), sets the unit scale
+  uDiskInner:     { value: 3.0 },   // ISCO ~ 3 * rs for a non-spinning hole
+  uDiskOuter:     { value: 17.0 },  // bigger, more Interstellar-scale disk
+  uDiskRotSpeed:  { value: 1.0 },
+  uDiskSpin:      { value: 1.0 },   // +1 / -1 flips the disk's rotation direction
+  uExposure:      { value: 1.3 },
+  uAxisTilt:      { value: 0.0 },   // radians; tilts the hole's own spin axis, independent of camera orbit
+};
+
+const vertexShader = /* glsl */ `
+  void main() {
+    gl_Position = vec4(position.xy, 0.0, 1.0);
+  }
+`;
+
+const fragmentShader = /* glsl */ `
+  uniform vec2  iResolution;
+  uniform float iTime;
+  uniform vec3  camPos;
+  uniform vec3  camRight;
+  uniform vec3  camUp;
+  uniform vec3  camForward;
+  uniform float camFov;
+  uniform float uRs;
+  uniform float uDiskInner;
+  uniform float uDiskOuter;
+  uniform float uDiskRotSpeed;
+  uniform float uDiskSpin;
+  uniform float uExposure;
+  uniform float uAxisTilt;
+
+  const int   MAX_STEPS = 170;
+  const float PI = 3.14159265359;
+
+  // ---- hash / noise -------------------------------------------------------
+  float hash13(vec3 p3) {
+    p3 = fract(p3 * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+  }
+
+  float noise3(vec3 x) {
+    vec3 i = floor(x);
+    vec3 f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(
+      mix(mix(hash13(i + vec3(0,0,0)), hash13(i + vec3(1,0,0)), f.x),
+          mix(hash13(i + vec3(0,1,0)), hash13(i + vec3(1,1,0)), f.x), f.y),
+      mix(mix(hash13(i + vec3(0,0,1)), hash13(i + vec3(1,0,1)), f.x),
+          mix(hash13(i + vec3(0,1,1)), hash13(i + vec3(1,1,1)), f.x), f.y),
+      f.z);
+  }
+
+  float fbm(vec3 p) {
+    float v = 0.0;
+    float a = 0.5;
+    for (int i = 0; i < 5; i++) {
+      v += a * noise3(p);
+      p *= 2.02;
+      a *= 0.5;
+    }
+    return v;
+  }
+
+  // ---- background: nebula, starfield, comets -------------------------------
+  // All sampled with the *lensed* ray direction, so gravitational distortion,
+  // the Einstein ring, and comet-trail warping fall straight out of the
+  // raymarch below -- no special casing needed here.
+
+  // Very sparse, low-opacity dust clouds -- distinct patches, not a global
+  // wash. Most directions get exact black; only high-noise patches show any
+  // color, and only in deep neutral blue tones (no purple/magenta).
+  vec3 nebula(vec3 dir) {
+    float n = fbm(dir * 2.2 + 5.0);
+    float mask = smoothstep(0.66, 0.92, n);
+    vec3 deepBlue = vec3(0.02, 0.03, 0.07);
+    vec3 cyan     = vec3(0.02, 0.08, 0.09);
+    float colorMix = hash13(floor(dir * 3.0 + 100.0));
+    vec3 tint = mix(deepBlue, cyan, colorMix);
+    return tint * mask * 0.35;
+  }
+
+  // A few distinct, colored nebula clouds at fixed world directions (as
+  // opposed to nebula()'s uniform sparse dust field) -- soft, irregular
+  // blobs shaped by noise so they don't read as perfect circles.
+  vec3 nebulaClouds(vec3 dir) {
+    vec3 col = vec3(0.0);
+    const int NC = 4;
+    vec3 dirs[4];
+    dirs[0] = normalize(vec3(-0.72,  0.48,  0.30));
+    dirs[1] = normalize(vec3( 0.58, -0.52, -0.42));
+    dirs[2] = normalize(vec3(-0.15, -0.68,  0.58));
+    dirs[3] = normalize(vec3( 0.35,  0.62, -0.55)); // small purple accent
+    vec3 cols[4];
+    cols[0] = vec3(0.55, 0.20, 0.06); // warm rust/ember glow, like the reference's corner nebula
+    cols[1] = vec3(0.42, 0.12, 0.05); // deeper red-orange dust
+    cols[2] = vec3(0.06, 0.08, 0.16); // faint cool navy, for contrast against the warm glow
+    cols[3] = vec3(0.34, 0.10, 0.44); // small purple/violet accent
+    float sizes[4];
+    sizes[0] = 0.42; sizes[1] = 0.32; sizes[2] = 0.42; sizes[3] = 0.20;
+
+    for (int i = 0; i < NC; i++) {
+      float ang = acos(clamp(dot(dir, dirs[i]), -1.0, 1.0));
+      float shape = fbm(dir * 3.5 + float(i) * 17.0);
+      float falloff = exp(-(ang * ang) / (sizes[i] * sizes[i]));
+      col += cols[i] * falloff * (0.35 + 0.9 * shape) * 0.5;
+    }
+    return col;
+  }
+
+  vec3 starfield(vec3 dir) {
+    vec3 col = vec3(0.0);
+
+    vec3 p = dir * 260.0;
+    vec3 ip = floor(p);
+    vec3 fp = fract(p);
+    float d = hash13(ip);
+
+    if (d > 0.9994) {
+      // rare, distinctly blue/orange beacon star -- bright enough that its
+      // smearing/duplication through the Einstein ring is easy to spot
+      bool warm = hash13(ip + 9.9) > 0.5;
+      vec3 tint = warm ? vec3(1.35, 0.9, 0.55) : vec3(0.6, 0.8, 1.4);
+      float dist = length(fp - 0.5);
+      float star = smoothstep(0.42, 0.0, dist);
+      col += tint * star * 5.5;
+    } else if (d > 0.9935) {
+      float brightness = hash13(ip + 7.7);
+      vec3 starColor = mix(vec3(0.8, 0.85, 1.0), vec3(1.0, 0.9, 0.75), hash13(ip + 3.3));
+      float dist = length(fp - 0.5);
+      float star = smoothstep(0.35, 0.0, dist) * brightness;
+      col += starColor * star * 3.2;
+    }
+
+    col += nebula(dir);
+    return col;
+  }
+
+  vec3 randDir(float seed) {
+    float a = hash13(vec3(seed, 1.7, 9.2)) * 6.2831853;
+    float z = hash13(vec3(seed, 4.4, 2.1)) * 2.0 - 1.0;
+    float rr = sqrt(max(0.0, 1.0 - z * z));
+    return vec3(rr * cos(a), z, rr * sin(a));
+  }
+
+  // Fixed, large, brightly-colored marker stars at hardcoded world directions.
+  // Static in world space (not orbiting themselves) -- as the camera orbits
+  // (which rotates camForward, since it always looks back at the origin),
+  // their direction relative to the view sweeps past the shadow, visibly
+  // shearing them into Einstein arcs that hug the disk's contour.
+  vec3 bigStars(vec3 dir) {
+    vec3 col = vec3(0.0);
+    const int N = 7;
+    vec3 dirs[7];
+    dirs[0] = normalize(vec3( 0.42,  0.16, -0.35));
+    dirs[1] = normalize(vec3(-0.55, -0.10,  0.30));
+    dirs[2] = normalize(vec3( 0.10,  0.62,  0.48));
+    dirs[3] = normalize(vec3(-0.30,  0.34, -0.62));
+    dirs[4] = normalize(vec3( 0.68, -0.22,  0.18));
+    dirs[5] = normalize(vec3( 1.00,  0.03,  0.08)); // near y=0: "horizontal" to the hole
+    dirs[6] = normalize(vec3(-0.53, -0.29, -0.77)); // near the default camForward, nudged up
+    vec3 cols[7];
+    cols[0] = vec3(0.55, 0.75, 1.7);  // blue giant
+    cols[1] = vec3(1.7, 1.15, 0.55);  // warm amber
+    cols[2] = vec3(1.55, 1.55, 1.65); // white
+    cols[3] = vec3(0.6, 0.85, 1.6);   // blue giant
+    cols[4] = vec3(1.65, 1.2, 0.7);   // amber
+    cols[5] = vec3(2.0, 0.32, 0.14);  // huge red giant
+    cols[6] = vec3(0.5, 0.85, 2.1);   // huge blue giant
+    // Stars 0, 2, 4, 5, 6 are dramatically enlarged into visible radiant
+    // discs, so their shearing into Einstein arcs near the shadow reads
+    // clearly; 1 and 3 stay small companions for scale.
+    float sizes[7];
+    sizes[0] = 0.013; sizes[1] = 0.0024; sizes[2] = 0.015; sizes[3] = 0.0020; sizes[4] = 0.011; sizes[5] = 0.020; sizes[6] = 0.022;
+
+    for (int i = 0; i < N; i++) {
+      float ang = acos(clamp(dot(dir, dirs[i]), -1.0, 1.0));
+      float core = smoothstep(sizes[i], 0.0, ang);
+      float glow = exp(-(ang * ang) / (sizes[i] * sizes[i] * 8.0)) * 0.5;
+      col += cols[i] * (core * 2.2 + glow);
+    }
+    return col;
+  }
+
+  // Cinematic comets: a bright point core plus a soft, exponentially-fading
+  // dust tail, on an angled great-circle trajectory that loops periodically.
+  // Rendered analytically in (along-track, cross-track) coordinates along
+  // the comet's path rather than as discrete dashes, so the tail is smooth
+  // and continuous. Sampled with the lensed ray direction like everything else in
+  // the background, so paths/tails that graze the shadow bend automatically.
+  vec3 comets(vec3 dir, float time) {
+    vec3 col = vec3(0.0);
+    const int N_COMETS = 2; // rare: at most 2 can ever be on screen at once
+    for (int i = 0; i < N_COMETS; i++) {
+      float seed = float(i) * 17.13;
+      vec3 axis = randDir(seed);
+      // Build a basis perpendicular to axis from a fixed reference vector
+      // (switched when axis is near-vertical) rather than from a *second*
+      // random direction -- the previous version derived e1 from randDir(seed
+      // + 31.7), and whenever that happened to land close to parallel with
+      // axis, e1 collapsed toward zero and every comet snapped to the same
+      // degenerate path/direction. This construction can't degenerate.
+      vec3 arbitrary = (abs(axis.y) < 0.95) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+      vec3 e1 = normalize(cross(arbitrary, axis));
+      vec3 e2 = cross(axis, e1);
+      float polar0 = mix(0.3, PI - 0.3, hash13(vec3(seed, 6.6, 2.9))); // path's tilt off the axis
+
+      float period = 18.0 + hash13(vec3(seed, 5.5, 1.1)) * 14.0;
+      float speed = 6.2831853 / period;
+      float phase = hash13(vec3(seed, 8.8, 3.3)) * 6.2831853;
+      float headAng = time * speed + phase;
+
+      float polarDir = acos(clamp(dot(dir, axis), -1.0, 1.0));
+      float crossTrack = polarDir - polar0;
+
+      float x = dot(dir, e1);
+      float y = dot(dir, e2);
+      float thetaDir = atan(y, x);
+
+      float along = headAng - thetaDir;
+      along = mod(along + PI, 2.0 * PI) - PI; // > 0 means "behind" the head
+
+      // Per-comet random scale: some are faint micro-streaks, others larger
+      // shooting stars. Shrinks core/tail width and brightness together.
+      float scale = 0.35 + hash13(vec3(seed, 4.1, 7.7)) * 1.05; // ~0.35 - 1.4
+      float invScale2 = 1.0 / (scale * scale);
+
+      float cross2 = crossTrack * crossTrack;
+      float core = exp(-(along * along * 700.0 + cross2 * 9000.0) * invScale2);
+
+      float sBehind = max(along, 0.0);
+      float tailWidth = (0.0018 + sBehind * 0.012) * scale;
+      float tail = exp(-sBehind * 13.0 / scale) * exp(-cross2 / (tailWidth * tailWidth)) * step(0.0, along);
+
+      float csel = hash13(vec3(seed, 2.2, 6.6));
+      vec3 tint = csel < 0.34 ? vec3(0.5, 1.3, 1.6)          // cyan ionized gas
+                : csel < 0.67 ? vec3(0.4, 1.45, 0.65)        // emerald green
+                :               vec3(1.55, 1.05, 0.45);      // warm sodium
+
+      col += tint * (core * 2.4 + tail * 0.9) * scale;
+    }
+    return col;
+  }
+
+  // ---- accretion disk -------------------------------------------------------
+  // Thin equatorial disk in the world XZ plane, starting strictly at the
+  // ISCO (uDiskInner = 3*rs) so there's a clean black gap between it and the
+  // horizon. Density comes from tangentially-stretched fbm turbulence
+  // advected by Keplerian shear; color from a deep fire temperature ramp;
+  // brightness/hue from relativistic Doppler beaming.
+
+  // Anisotropic fbm: divides the .x sample coordinate by stretch before
+  // each octave, elongating noise features along whichever axis is fed in
+  // as .x. Used with the tangential (flow) coordinate as .x so turbulence
+  // reads as fibrous filaments dragged around the orbit, not an isotropic
+  // airbrushed blob.
+  float fbmFlow(vec3 p, float stretch) {
+    float v = 0.0;
+    float a = 0.5;
+    for (int i = 0; i < 5; i++) {
+      vec3 q = vec3(p.x / stretch, p.y, p.z);
+      v += a * noise3(q);
+      p *= 2.3;
+      a *= 0.55;
+    }
+    return v;
+  }
+
+  // Cinematic Interstellar-reference palette: white-hot only right at the
+  // core/ISCO (feeds the bright ring), then almost immediately into deep
+  // red-orange for the bulk of the disk, darkening to near-black embers at
+  // the fringe. Much redder and less yellow than the golden-fire version in
+  // index.html -- matched against a real Gargantua reference frame, which is
+  // dominated by red/orange with white confined to the core and lensed ring.
+  vec3 diskRamp(float t) {
+    vec3 white     = vec3(1.0, 1.0, 1.0)      * 2.8;  // hottest -- core + ring
+    vec3 paleGold  = vec3(1.0, 0.85, 0.65)    * 2.0;  // brief warm-white transition
+    vec3 redOrange = vec3(0.95, 0.30, 0.06)   * 1.35; // dominant through most of the disk
+    vec3 deepRed   = vec3(0.55, 0.09, 0.02)   * 0.95; // outer disk
+    vec3 ember     = vec3(0.12, 0.02, 0.0)    * 0.55; // fringe
+
+    vec3 c = mix(white, paleGold, smoothstep(0.0, 0.06, t));
+    c = mix(c, redOrange, smoothstep(0.04, 0.24, t));
+    c = mix(c, deepRed, smoothstep(0.22, 0.65, t));
+    c = mix(c, ember, smoothstep(0.55, 1.0, t));
+    c = mix(c, vec3(0.0), smoothstep(0.95, 1.2, t)); // softly dissolve to black
+    return c;
+  }
+
+  vec3 diskColor(vec3 p, vec3 rayDir, float innerR, float outerR, float time) {
+    float r = length(p.xz);
+    float phi = atan(p.z, p.x);
+
+    // Unclamped above 1: lets the wispy outer tendrils below extend past
+    // the nominal outerR instead of hard-clipping at it.
+    float t = max((r - innerR) / (outerR - innerR), 0.0);
+
+    float omega = 1.15 / pow(r / innerR, 1.5); // Keplerian shear, omega ~ r^-1.5
+    // A large fixed offset on the winding clock only (not on the other
+    // animation timers below) so the differential shear between radii is
+    // already fully wound up on the very first frame -- without it, swirl
+    // starts equal to phi everywhere (zero shear) and visibly takes several
+    // seconds of real time to twist into tight concentric bands.
+    float windTime = 12.0 + time;
+    float swirl = phi - omega * windTime * uDiskRotSpeed * uDiskSpin;
+
+    // cos/sin embedding, NOT the raw angle -- swirl itself wraps by 2*PI
+    // at phi = +-PI, so using it directly as a linear coordinate (an earlier
+    // version did) tears a visible seam/stripe straight across the disk at
+    // that wraparound. cos(swirl)/sin(swirl) are continuous everywhere, so
+    // this embedding has no seam; stretching its .x axis in fbmFlow still
+    // elongates features (into gently spiraling filaments, since the frame
+    // itself differentially rotates with r) with no discontinuity.
+    // Slow radial frequency (0.09 -> 0.035): the previous rate changed
+    // color with r fast enough, relative to the tightly-wound swirl, that
+    // the pattern read as thin concentric rings rather than a soft gradient
+    // with a hint of texture underneath.
+    vec2 flowXY = vec2(cos(swirl), sin(swirl)) * r;
+    vec3 flowP = vec3(flowXY.x * 0.22, flowXY.y * 0.22, r * 0.035 - time * 0.05);
+    float n = fbmFlow(flowP, 2.6);
+    n = clamp(n, 0.0, 1.0); // no extra contrast curve -- keep it soft
+
+    // Faint, soft dust lanes -- wide transition, mild darkening (was a much
+    // harder-edged, darker carve that read as stripes).
+    float lanes = noise3(vec3(flowXY.x * 0.5, flowXY.y * 0.5, time * 0.08));
+    float dust = smoothstep(0.2, 0.8, lanes);
+
+    // Mild perturbation of the ramp's radius input with the local
+    // turbulence so color bands wobble gently with the texture instead of
+    // forming perfect concentric rings, without reintroducing hard stripes.
+    vec3 baseColor = diskRamp(t + (n - 0.5) * 0.07);
+
+    // Ragged, per-angle noise-varied outer edge -- wispy tendrils fading
+    // into space instead of a hard boundary. Inner edge stays tight so the
+    // ISCO gap reads as a clean cutoff, not a blurred fade-in.
+    float edgeNoise = fbm(vec3(cos(phi) * 2.4, sin(phi) * 2.4, time * 0.025));
+    float outerEdge = 0.88 + edgeNoise * 0.4;
+    float density = smoothstep(0.0, 0.045, t) * (1.0 - smoothstep(0.55, outerEdge, t));
+    density *= (0.65 + 0.45 * n) * mix(0.7, 1.0, dust);
+
+    vec3 tangent = normalize(vec3(-p.z, 0.0, p.x)) * uDiskSpin;
+    float vOrb = clamp(sqrt(uRs / (2.0 * r)), 0.0, 0.95);
+    float mu = dot(tangent, -rayDir);
+    float dopplerFactor = 1.0 / max(0.15, (1.0 - vOrb * mu));
+    float beaming = pow(dopplerFactor, 1.8);
+
+    vec3 col = baseColor * density * beaming;
+    col.b *= clamp(dopplerFactor, 0.5, 1.8);
+    col.r *= clamp(2.0 - dopplerFactor, 0.4, 1.5);
+
+    // Local compression (stronger than a plain HDR clamp) so the brightened
+    // (approaching) side keeps its filament detail instead of blowing out
+    // to flat white.
+    col = col / (1.0 + 0.6 * col);
+
+    return max(col, 0.0);
+  }
+
+  vec3 acesFilm(vec3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+  }
+
+  // Rotates v by angle a around the X axis. Used to tilt the hole's own
+  // spin axis away from world +Y, independent of camera orbit -- applied to
+  // the incoming ray once, up front, which is equivalent to tilting the
+  // whole hole+disk system instead of the camera.
+  vec3 rotateX(vec3 v, float a) {
+    float c = cos(a), s = sin(a);
+    return vec3(v.x, v.y * c - v.z * s, v.y * s + v.z * c);
+  }
+
+  // ---- geodesic raymarch ----------------------------------------------------
+  // Approximates the Schwarzschild null-geodesic equation with a central
+  // "force" accel = -1.5 * rs * h^2 / r^5 * pos, where h = pos0 x dir0 is the
+  // photon's angular momentum. Because the force is purely radial, h is exact
+  // to this equation (d/dt[pos x vel] = vel x vel + pos x accel = 0), so the
+  // photon path stays in a single plane and bends the way light really does
+  // near a Schwarzschild hole to leading order.
+  vec3 traceRay(vec3 ro, vec3 rd) {
+    vec3 pos = rotateX(ro, -uAxisTilt);
+    vec3 dir = rotateX(rd, -uAxisTilt);
+    vec3 h = cross(pos, dir);
+    float h2 = dot(h, h);
+
+    float escapeR = uRs * 140.0; // rescaled margin beyond the new MAX_R=70 camera range
+    bool hitHorizon = false;
+
+    // Deflection falloff: a steep-but-smooth rational knee, not a hard
+    // on/off switch (a literal hard cutoff, tried previously, leaves a
+    // visible ring-shaped seam in the star field instead of fading
+    // naturally). lensR sits well inside the disk's own radius -- at
+    // lensR itself, only the ISCO/inner-disk region is still full-strength;
+    // by the disk's outer edge bending is already faint, and comets/stars
+    // whose direction only grazes the outer disk or beyond stay essentially
+    // unbent, instead of a "far away" object still visibly warping.
+    float lensR = uDiskOuter * 0.5;
+
+    // Secondary lensed photon ring: sits in the gap between the horizon and
+    // the ISCO, close to the photon-sphere scale where light can orbit
+    // multiple times before escaping. Detected via closest approach (minR)
+    // rather than per-step proximity: a ray plunging in radially passes
+    // through r=photonR only once and its minR keeps falling well past it
+    // (down toward the horizon), so it stays dark; only a ray whose
+    // trajectory actually turns around near the photon sphere (grazing,
+    // near-critical impact parameter -- the ones that really do linger
+    // there) bottoms out with minR close to photonR and lights up. A
+    // per-step version tried first washed the *entire* shadow interior with
+    // glow, since almost every captured ray crosses that radius once.
+    // Pulled in from 2.6 to 2.2 rs so it sits with clearer dark separation
+    // from the bright disk band above it, instead of nearly touching it.
+    float photonR = uRs * 2.2;
+    float ringWidth = uRs * 0.055; // razor-thin
+    vec3 ringGlowCol = vec3(2.0, 1.9, 1.7); // near-white, matching the reference's blazing ring
+    float minR = escapeR;
+
+    vec3 accumColor = vec3(0.0);
+    float accumAlpha = 0.0;
+
+    for (int i = 0; i < MAX_STEPS; i++) {
+      float r = length(pos);
+      minR = min(minR, r);
+      if (r < uRs * 1.02) { hitHorizon = true; break; }
+      if (r > escapeR || accumAlpha > 0.995) { break; }
+
+      float dt = clamp(r * 0.12, 0.015, 1.4);
+
+      float atten = 1.0 / (1.0 + pow(r / lensR, 8.0));
+      vec3 accel = -1.5 * uRs * h2 * pos / pow(r, 5.0) * atten;
+      vec3 newDir = normalize(dir + accel * dt);
+      vec3 newPos = pos + newDir * dt;
+
+      // did we cross the equatorial (disk) plane this step?
+      if (sign(pos.y) != sign(newPos.y)) {
+        float tc = pos.y / (pos.y - newPos.y);
+        vec3 hitP = mix(pos, newPos, tc);
+        float rHit = length(hitP.xz);
+        // Widened past uDiskOuter so diskColor's own noise-ragged outer
+        // taper (wispy tendrils) doesn't get hard-clipped here first.
+        if (rHit > uDiskInner && rHit < uDiskOuter * 1.3) {
+          vec3 dcol = diskColor(hitP, newDir, uDiskInner, uDiskOuter, iTime);
+          float a = clamp(max(max(dcol.r, dcol.g), dcol.b) * 0.75, 0.0, 1.0);
+          accumColor += (1.0 - accumAlpha) * dcol;
+          accumAlpha += (1.0 - accumAlpha) * a;
+        }
+      }
+
+      pos = newPos;
+      dir = newDir;
+    }
+
+    vec3 bg = hitHorizon ? vec3(0.0) : (starfield(dir) + bigStars(dir) + comets(dir, iTime) + nebulaClouds(dir));
+    float ringGlow = exp(-pow((minR - photonR) / ringWidth, 2.0));
+    vec3 ring = ringGlowCol * ringGlow * 2.8;
+    return accumColor + (1.0 - accumAlpha) * (bg + ring);
+  }
+
+  void main() {
+    vec2 uv = (gl_FragCoord.xy / iResolution.xy - 0.5) * 2.0;
+    uv.x *= iResolution.x / iResolution.y;
+
+    float tanFov = tan(camFov * 0.5);
+    vec3 rayDir = normalize(camForward + uv.x * tanFov * camRight + uv.y * tanFov * camUp);
+
+    vec3 col = traceRay(camPos, rayDir);
+
+    col = acesFilm(col * uExposure);
+    col = pow(col, vec3(1.0 / 2.2));
+
+    gl_FragColor = vec4(col, 1.0);
+  }
+`;
+
+const material = new THREE.ShaderMaterial({
+  uniforms, vertexShader, fragmentShader,
+  depthWrite: false, depthTest: false,
+});
+
+scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material));
+
+// ---------------------------------------------------------------------------
+// Orbit camera: drag to rotate, wheel to zoom. Basis vectors are computed on
+// the CPU each frame and handed to the shader as uniforms.
+// ---------------------------------------------------------------------------
+let theta = 0.5;          // azimuth
+let phi = 1.49;            // near edge-on (pi/2 = 1.5708) -- this is the defining trait of the
+                            // reference look: a thin, near edge-on disk reads as a sharp bright
+                            // blade sweeping to one side, with the far side lensed into a big
+                            // ring wrapping over the top, instead of a "donut seen from above"
+let radius = 20.0;         // in units of uRs
+const MIN_R = 7.0, MAX_R = 70.0;
+
+let dragging = false, lastX = 0, lastY = 0;
+const dom = renderer.domElement;
+
+dom.addEventListener("pointerdown", (e) => {
+  dragging = true; lastX = e.clientX; lastY = e.clientY;
+  dom.setPointerCapture(e.pointerId);
+});
+window.addEventListener("pointerup", () => { dragging = false; });
+window.addEventListener("pointercancel", () => { dragging = false; });
+window.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  const dx = e.clientX - lastX, dy = e.clientY - lastY;
+  lastX = e.clientX; lastY = e.clientY;
+  theta -= dx * 0.0045;
+  phi -= dy * 0.0045;
+  phi = Math.min(Math.max(phi, 0.15), Math.PI - 0.15);
+});
+dom.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  radius *= Math.exp(e.deltaY * 0.0015);
+  radius = Math.min(Math.max(radius, MIN_R), MAX_R);
+}, { passive: false });
+
+// Axis-tilt panel: tilts the hole's own spin axis (uAxisTilt, applied inside
+// the shader's raymarch) independently of camera orbit.
+const tiltSlider = document.getElementById("tilt");
+const tiltVal = document.getElementById("tiltVal");
+tiltSlider.addEventListener("input", () => {
+  const deg = Number(tiltSlider.value);
+  uniforms.uAxisTilt.value = THREE.MathUtils.degToRad(deg);
+  tiltVal.textContent = deg + "°";
+});
+
+function updateCamera() {
+  const camPos = uniforms.camPos.value;
+  camPos.set(
+    radius * Math.sin(phi) * Math.sin(theta),
+    radius * Math.cos(phi),
+    radius * Math.sin(phi) * Math.cos(theta)
+  );
+  const forward = uniforms.camForward.value.copy(camPos).multiplyScalar(-1).normalize();
+  const worldUp = new THREE.Vector3(0, 1, 0);
+  const right = uniforms.camRight.value.crossVectors(forward, worldUp).normalize();
+  uniforms.camUp.value.crossVectors(right, forward).normalize();
+}
+
+function onResize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h);
+  const pr = renderer.getPixelRatio();
+  uniforms.iResolution.value.set(w * pr, h * pr);
+}
+window.addEventListener("resize", onResize);
+onResize();
+
+const clock = new THREE.Clock();
+function animate() {
+  requestAnimationFrame(animate);
+  uniforms.iTime.value = clock.getElapsedTime();
+  updateCamera();
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+</body>
+</html>
